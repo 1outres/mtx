@@ -18,12 +18,26 @@ pub enum Capability {
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 pub enum ClientToDaemon {
-    Hello { version: u16, capabilities: Vec<Capability> },
-    CreateSession { name: String },
-    Attach { session: SessionId },
+    Hello {
+        version: u16,
+        capabilities: Vec<Capability>,
+    },
+    CreateSession {
+        name: String,
+    },
+    Attach {
+        session: SessionId,
+    },
     Detach,
-    Stdin { pane: PaneId, data: Vec<u8> },
-    Resize { pane: PaneId, cols: u16, rows: u16 },
+    Stdin {
+        pane: PaneId,
+        data: Vec<u8>,
+    },
+    Resize {
+        pane: PaneId,
+        cols: u16,
+        rows: u16,
+    },
     Ping(u64),
 }
 
@@ -57,13 +71,43 @@ pub fn decode_msg<T: DeserializeOwned>(buf: &[u8]) -> Result<T, ProtocolError> {
 
 /// Simple length-prefixed framing (big endian u32 length).
 pub mod frame {
-    use std::io::{self, Read, Write};
+    use std::io::{self, IoSlice, Read, Write};
     use std::os::unix::net::UnixStream;
 
     pub fn write(stream: &mut UnixStream, payload: &[u8]) -> io::Result<()> {
-        let len = payload.len() as u32;
-        stream.write_all(&len.to_be_bytes())?;
-        stream.write_all(payload)
+        let len = (payload.len() as u32).to_be_bytes();
+        let mut len_sent = 0;
+        let mut payload_sent = 0;
+        let total = len.len() + payload.len();
+        let mut written = 0;
+        while written < total {
+            // Rebuild slices each loop to avoid aliasing/borrow issues.
+            let mut bufs = if len_sent < len.len() {
+                [
+                    IoSlice::new(&len[len_sent..]),
+                    IoSlice::new(&payload[payload_sent..]),
+                ]
+            } else {
+                [IoSlice::new(&payload[payload_sent..]), IoSlice::new(&[])]
+            };
+            let n = stream.write_vectored(&mut bufs)?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write length-prefixed frame",
+                ));
+            }
+            written += n;
+            // Advance counters.
+            if len_sent < len.len() {
+                let advance = n.min(len.len() - len_sent);
+                len_sent += advance;
+                payload_sent += n.saturating_sub(advance);
+            } else {
+                payload_sent += n;
+            }
+        }
+        Ok(())
     }
 
     pub fn read(stream: &mut UnixStream) -> io::Result<Vec<u8>> {

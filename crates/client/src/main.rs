@@ -2,18 +2,18 @@ use anyhow::{Context, Result};
 use mxr_protocol::{
     decode_msg, encode_msg, frame, Capability, ClientToDaemon, DaemonToClient, PROTOCOL_VERSION,
 };
-use std::env;
-use std::io::{self, Read, Write};
-use std::os::unix::net::UnixStream;
-use std::os::fd::BorrowedFd;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
 use nix::libc::winsize;
 use nix::sys::signal::Signal;
 use nix::sys::termios::{self, ControlFlags, InputFlags, LocalFlags, OutputFlags, SetArg, Termios};
 use signal_hook::flag as signal_flag;
+use std::env;
+use std::io::{self, Read, Write};
+use std::os::fd::BorrowedFd;
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -147,7 +147,8 @@ fn enable_raw_mode() -> Result<RawModeGuard> {
         | InputFlags::ISTRIP
         | InputFlags::IXON);
     raw.control_flags |= ControlFlags::CS8;
-    raw.local_flags &= !(LocalFlags::ECHO | LocalFlags::ICANON | LocalFlags::IEXTEN | LocalFlags::ISIG);
+    raw.local_flags &=
+        !(LocalFlags::ECHO | LocalFlags::ICANON | LocalFlags::IEXTEN | LocalFlags::ISIG);
     raw.output_flags &= !(OutputFlags::OPOST);
     termios::tcsetattr(fd, SetArg::TCSANOW, &raw).map_err(|e| anyhow::anyhow!(e))?;
     Ok(RawModeGuard { orig, fd_raw })

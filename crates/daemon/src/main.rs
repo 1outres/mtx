@@ -1,27 +1,27 @@
 use anyhow::{Context, Result};
 use mxr_protocol::{
-    decode_msg, encode_msg, ClientToDaemon, DaemonToClient, PaneId, PROTOCOL_VERSION, SessionId,
+    decode_msg, encode_msg, ClientToDaemon, DaemonToClient, PaneId, SessionId, PROTOCOL_VERSION,
 };
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
 use std::os::unix::io::RawFd;
+use std::path::{Path, PathBuf};
 // IntoRawFd provided by rustix_openpty::rustix::fd
 use std::ffi::CString;
 use std::time::Instant;
 use tracing::{debug, error, info};
 
+use libc;
 use mio::net::{UnixListener, UnixStream};
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token, Waker};
-use rustix_openpty::rustix::fd::{AsRawFd, OwnedFd, IntoRawFd};
-use rustix_openpty::rustix::io::{ioctl_fionbio, Errno};
-use nix::unistd::{fork, ForkResult, setsid, dup2, execvp};
-use nix::unistd::close;
-use libc;
 use nix::libc::winsize;
 use nix::libc::TIOCSWINSZ;
+use nix::unistd::close;
+use nix::unistd::{dup2, execvp, fork, setsid, ForkResult};
+use rustix_openpty::rustix::fd::{AsRawFd, IntoRawFd, OwnedFd};
+use rustix_openpty::rustix::io::{ioctl_fionbio, Errno};
 
 #[allow(dead_code)]
 struct Session {
@@ -37,6 +37,7 @@ struct Pane {
     fd: RawFd,
     master: OwnedFd,
     buf: Vec<u8>,
+    write_buf: Vec<u8>,
     child: Option<nix::unistd::Pid>,
 }
 
@@ -54,6 +55,7 @@ impl Pane {
             fd,
             master,
             buf: Vec::with_capacity(4096),
+            write_buf: Vec::with_capacity(4096),
             child: Some(child),
         })
     }
@@ -70,6 +72,31 @@ impl Pane {
             Err(err) if err == Errno::AGAIN || err == Errno::WOULDBLOCK => Ok(Some(0)),
             Err(err) => Err(errno_to_io(err)),
         }
+    }
+
+    /// Try to flush pending stdin data into the PTY. Leaves remaining bytes in write_buf
+    /// on EAGAIN/WOULDBLOCK so that a WRITABLE event will retry.
+    fn flush_write_buf(&mut self) -> io::Result<()> {
+        while !self.write_buf.is_empty() {
+            match rustix_openpty::rustix::io::write(&self.master, &self.write_buf) {
+                Ok(0) => {
+                    // Treat as would-block to avoid busy loop.
+                    break;
+                }
+                Ok(n) => {
+                    self.write_buf.drain(..n);
+                }
+                Err(err) if err == Errno::AGAIN || err == Errno::WOULDBLOCK => break,
+                Err(err) => {
+                    // EINTR should retry, others bubble up.
+                    if err.raw_os_error() == libc::EINTR {
+                        continue;
+                    }
+                    return Err(errno_to_io(err));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -127,27 +154,22 @@ fn main() -> Result<()> {
         poll.poll(&mut events, None)?;
         for event in events.iter() {
             match event.token() {
-                LISTENER => {
-                    loop {
-                        match listener.accept() {
-                            Ok((mut stream, _addr)) => {
-                                let token = state.alloc_token();
-                                poll.registry().register(
-                                    &mut stream,
-                                    token,
-                                    Interest::READABLE,
-                                )?;
-                                clients.insert(token, ClientConn::new(stream));
-                                debug!("client accepted token={:?}", token);
-                            }
-                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                            Err(e) => {
-                                error!("accept error: {e:?}");
-                                break;
-                            }
+                LISTENER => loop {
+                    match listener.accept() {
+                        Ok((mut stream, _addr)) => {
+                            let token = state.alloc_token();
+                            poll.registry()
+                                .register(&mut stream, token, Interest::READABLE)?;
+                            clients.insert(token, ClientConn::new(stream));
+                            debug!("client accepted token={:?}", token);
+                        }
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => {
+                            error!("accept error: {e:?}");
+                            break;
                         }
                     }
-                }
+                },
                 token if token == Token(usize::MAX) => {
                     // waker — no-op for now
                     let _ = &wake;
@@ -184,34 +206,47 @@ fn main() -> Result<()> {
                         } else {
                             Interest::READABLE
                         };
-                        if let Err(e) = poll
-                            .registry()
-                            .reregister(&mut conn.stream, token, interest)
+                        if let Err(e) =
+                            poll.registry()
+                                .reregister(&mut conn.stream, token, interest)
                         {
                             error!("reregister error {token:?}: {e:?}");
                             clients.remove(&token);
                         }
                     } else if let Some(pane) = state.panes.get_mut(&token) {
+                        // READABLE: consume PTY output and fan-out
                         if event.is_readable() {
                             match pane.read_pty() {
                                 Ok(Some(n)) => {
                                     debug!("pane {:?} read {} bytes", token, n);
-                                    // fan-out to attached clients
                                     if !pane.buf.is_empty() {
-                                        let data = std::mem::take(&mut pane.buf);
-                                        for (ctok, client) in clients.iter_mut() {
-                                            if client.attached_pane == Some(token) {
-                                                client.queue(DaemonToClient::PaneData {
-                                                    pane: pane.id,
-                                                    data: data.clone(),
-                                                })?;
-                                                // 確実に書き出すため WRITABLE を有効化
-                                                poll.registry().reregister(
-                                                    &mut client.stream,
-                                                    *ctok,
-                                                    Interest::READABLE.add(Interest::WRITABLE),
-                                                )?;
+                                        let targets: Vec<Token> = clients
+                                            .iter()
+                                            .filter_map(|(ctok, client)| {
+                                                (client.attached_pane == Some(token))
+                                                    .then_some(*ctok)
+                                            })
+                                            .collect();
+                                        if !targets.is_empty() {
+                                            let data = std::mem::take(&mut pane.buf);
+                                            // Encode once and fan out without extra clones.
+                                            let encoded = encode_msg(&DaemonToClient::PaneData {
+                                                pane: pane.id,
+                                                data,
+                                            })?;
+                                            for ctok in targets {
+                                                if let Some(client) = clients.get_mut(&ctok) {
+                                                    client.queue_encoded(&encoded);
+                                                    poll.registry().reregister(
+                                                        &mut client.stream,
+                                                        ctok,
+                                                        Interest::READABLE.add(Interest::WRITABLE),
+                                                    )?;
+                                                }
                                             }
+                                        } else {
+                                            // drop buffered output when no clients attached
+                                            pane.buf.clear();
                                         }
                                     }
                                 }
@@ -222,6 +257,7 @@ fn main() -> Result<()> {
                                         error!("deregister pane {:?}: {e:?}", token);
                                     }
                                     state.panes.remove(&token);
+                                    continue;
                                 }
                                 Err(e) => {
                                     error!("pane read error {:?}: {e:?}", token);
@@ -230,7 +266,36 @@ fn main() -> Result<()> {
                                         error!("deregister pane {:?}: {e2:?}", token);
                                     }
                                     state.panes.remove(&token);
+                                    continue;
                                 }
+                            }
+                        }
+
+                        // WRITABLE: flush pending stdin data to PTY
+                        if event.is_writable() {
+                            if let Err(e) = pane.flush_write_buf() {
+                                error!("pane write error {:?}: {e:?}", token);
+                                let mut source = SourceFd(&pane.fd);
+                                if let Err(e2) = poll.registry().deregister(&mut source) {
+                                    error!("deregister pane {:?}: {e2:?}", token);
+                                }
+                                state.panes.remove(&token);
+                                continue;
+                            }
+                        }
+
+                        // Update interest based on remaining pending writes.
+                        if let Some(pane) = state.panes.get(&token) {
+                            let mut source = SourceFd(&pane.fd);
+                            let interest = if pane.write_buf.is_empty() {
+                                Interest::READABLE
+                            } else {
+                                Interest::READABLE.add(Interest::WRITABLE)
+                            };
+                            if let Err(e) = poll.registry().reregister(&mut source, token, interest)
+                            {
+                                error!("reregister pane {:?}: {e:?}", token);
+                                state.panes.remove(&token);
                             }
                         }
                     }
@@ -318,6 +383,7 @@ struct ClientConn {
     len_filled: usize,
     expected_payload: Option<usize>,
     payload: Vec<u8>,
+    payload_filled: usize,
     handshaken: bool,
     write_buf: Vec<u8>,
     attached_pane: Option<Token>,
@@ -331,6 +397,7 @@ impl ClientConn {
             len_filled: 0,
             expected_payload: None,
             payload: Vec::new(),
+            payload_filled: 0,
             handshaken: false,
             write_buf: Vec::new(),
             attached_pane: None,
@@ -351,8 +418,8 @@ impl ClientConn {
                         }
                         let len = u32::from_be_bytes(self.len_buf) as usize;
                         self.expected_payload = Some(len);
-                        self.payload.clear();
-                        self.payload.reserve(len);
+                        self.payload_filled = 0;
+                        self.payload.resize(len, 0);
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(true),
                     Err(e) => return Err(e.into()),
@@ -361,13 +428,14 @@ impl ClientConn {
 
             // read payload
             if let Some(len) = self.expected_payload {
-                let to_read = len - self.payload.len();
-                let mut buf = vec![0u8; to_read];
-                match self.stream.read(&mut buf) {
+                match self
+                    .stream
+                    .read(&mut self.payload[self.payload_filled..len])
+                {
                     Ok(0) => return Ok(false),
                     Ok(n) => {
-                        self.payload.extend_from_slice(&buf[..n]);
-                        if self.payload.len() < len {
+                        self.payload_filled += n;
+                        if self.payload_filled < len {
                             return Ok(true);
                         }
                     }
@@ -375,13 +443,14 @@ impl ClientConn {
                     Err(e) => return Err(e.into()),
                 }
 
-                if self.payload.len() == len {
+                if self.payload_filled == len {
                     self.process_one(state, registry)?;
                     // reset to read next frame
                     self.len_buf = [0; 4];
                     self.len_filled = 0;
                     self.expected_payload = None;
                     self.payload.clear();
+                    self.payload_filled = 0;
                 }
             }
         }
@@ -390,7 +459,11 @@ impl ClientConn {
     fn process_one(&mut self, state: &mut State, registry: &mio::Registry) -> Result<()> {
         let msg: ClientToDaemon = decode_msg(&self.payload)?;
         if !self.handshaken {
-            if let ClientToDaemon::Hello { version, capabilities: _ } = msg {
+            if let ClientToDaemon::Hello {
+                version,
+                capabilities: _,
+            } = msg
+            {
                 if version != PROTOCOL_VERSION {
                     self.queue(DaemonToClient::Error {
                         message: format!(
@@ -424,7 +497,9 @@ impl ClientConn {
                 state.sessions.insert(session_id, session);
                 state.pane_token_by_id.insert(pane_id, pane_token);
                 debug!("session {} created with pane {:?}", session_id, pane_token);
-                self.queue(DaemonToClient::SessionCreated { session: session_id })?;
+                self.queue(DaemonToClient::SessionCreated {
+                    session: session_id,
+                })?;
                 self.queue(DaemonToClient::AttachOk { pane: pane_id })?;
                 self.attached_pane = Some(pane_token);
             }
@@ -445,20 +520,19 @@ impl ClientConn {
             ClientToDaemon::Stdin { pane, data } => {
                 if let Some(token) = state.pane_token_by_id.get(&pane).copied() {
                     if let Some(p) = state.panes.get_mut(&token) {
-                        let mut written = 0;
-                        while written < data.len() {
-                            match rustix_openpty::rustix::io::write(&p.master, &data[written..]) {
-                                Ok(0) => break,
-                                Ok(n) => written += n,
-                                Err(e) if e == Errno::WOULDBLOCK || e == Errno::AGAIN => break,
-                                Err(e) => {
-                                    self.queue(DaemonToClient::Error {
-                                        message: format!("write failed: {e:?}"),
-                                    })?;
-                                    break;
-                                }
-                            }
+                        p.write_buf.extend_from_slice(&data);
+                        if let Err(e) = p.flush_write_buf() {
+                            self.queue(DaemonToClient::Error {
+                                message: format!("write failed: {e:?}"),
+                            })?;
                         }
+                        let mut source = SourceFd(&p.fd);
+                        let interest = if p.write_buf.is_empty() {
+                            Interest::READABLE
+                        } else {
+                            Interest::READABLE.add(Interest::WRITABLE)
+                        };
+                        registry.reregister(&mut source, token, interest)?;
                     } else {
                         self.queue(DaemonToClient::Error {
                             message: "pane token missing".into(),
@@ -500,10 +574,14 @@ impl ClientConn {
 
     fn queue(&mut self, msg: DaemonToClient) -> Result<()> {
         let encoded = encode_msg(&msg)?;
+        self.queue_encoded(&encoded);
+        Ok(())
+    }
+
+    fn queue_encoded(&mut self, encoded: &[u8]) {
         self.write_buf
             .extend_from_slice(&(encoded.len() as u32).to_be_bytes());
-        self.write_buf.extend_from_slice(&encoded);
-        Ok(())
+        self.write_buf.extend_from_slice(encoded);
     }
 
     fn flush_write_buf(&mut self) -> io::Result<()> {
