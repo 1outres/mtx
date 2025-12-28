@@ -1,0 +1,15 @@
+[package]
+name = "mxrd"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+mxr-protocol = { path = "../protocol" }
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+mio = { version = "0.8", features = ["os-poll", "net", "os-ext"] }
+rustix-openpty = "0.2"
+nix = { version = "0.28", default-features = false, features = ["process", "term", "fs"] }
+libc = "0.2"
