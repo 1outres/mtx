@@ -8,7 +8,7 @@ use nix::sys::termios::{self, ControlFlags, InputFlags, LocalFlags, OutputFlags,
 use signal_hook::flag as signal_flag;
 use std::env;
 use std::io::{self, Read, Write};
-use std::os::fd::BorrowedFd;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,14 +49,29 @@ fn main() -> Result<()> {
             // 端末を raw にし、初期サイズ送信
             let mut raw_guard = Some(enable_raw_mode()?);
             send_resize(&mut stream, pane_id)?;
+            // stdin を非ブロッキングにし、デーモン切断時にループを抜けやすくする
+            let stdin_fd = io::stdin().as_raw_fd();
+            let orig_flags = nix::fcntl::fcntl(stdin_fd, nix::fcntl::F_GETFL)?;
+            nix::fcntl::fcntl(
+                stdin_fd,
+                nix::fcntl::F_SETFL(
+                    nix::fcntl::OFlag::from_bits_truncate(orig_flags)
+                        | nix::fcntl::OFlag::O_NONBLOCK,
+                ),
+            )?;
 
             // SIGWINCH 監視
             let winch = Arc::new(AtomicBool::new(false));
             signal_flag::register(Signal::SIGWINCH as i32, Arc::clone(&winch))?;
 
             let stream_arc = Arc::new(Mutex::new(stream));
+            let alive = Arc::new(AtomicBool::new(true));
+            let idle_limit = std::env::var("MXR_BENCH_IDLE_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok());
             {
                 let s = Arc::clone(&stream_arc);
+                let alive = Arc::clone(&alive);
                 thread::spawn(move || -> Result<()> {
                     let mut local = s.lock().unwrap().try_clone().context("clone stream")?;
                     loop {
@@ -66,7 +81,10 @@ fn main() -> Result<()> {
                                 io::stdout().flush()?;
                             }
                             Some(_) => {}
-                            None => break,
+                            None => {
+                                alive.store(false, Ordering::SeqCst);
+                                break;
+                            }
                         }
                     }
                     Ok(())
@@ -75,20 +93,38 @@ fn main() -> Result<()> {
             // stdin -> daemon
             let mut stdin = io::stdin();
             let mut buf = [0u8; 1024];
+            let mut idle_ms = 0u64;
             loop {
-                let n = stdin.read(&mut buf)?;
-                if n == 0 {
-                    break;
+                match stdin.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        idle_ms = 0;
+                        if winch.swap(false, Ordering::SeqCst) {
+                            send_resize(&mut *stream_arc.lock().unwrap(), pane_id)?;
+                        }
+                        let msg = ClientToDaemon::Stdin {
+                            pane: pane_id,
+                            data: buf[..n].to_vec(),
+                        };
+                        let mut locked = stream_arc.lock().unwrap();
+                        send(&mut *locked, &msg)?;
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        if let Some(limit) = idle_limit {
+                            idle_ms += 2;
+                            if idle_ms >= limit {
+                                break;
+                            }
+                        }
+                        if !alive.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e.into()),
                 }
-                if winch.swap(false, Ordering::SeqCst) {
-                    send_resize(&mut *stream_arc.lock().unwrap(), pane_id)?;
-                }
-                let msg = ClientToDaemon::Stdin {
-                    pane: pane_id,
-                    data: buf[..n].to_vec(),
-                };
-                let mut locked = stream_arc.lock().unwrap();
-                send(&mut *locked, &msg)?;
             }
 
             if let Some(g) = raw_guard.take() {

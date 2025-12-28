@@ -252,20 +252,12 @@ fn main() -> Result<()> {
                                 }
                                 Ok(None) => {
                                     debug!("pane {:?} closed", token);
-                                    let mut source = SourceFd(&pane.fd);
-                                    if let Err(e) = poll.registry().deregister(&mut source) {
-                                        error!("deregister pane {:?}: {e:?}", token);
-                                    }
-                                    state.panes.remove(&token);
+                                    handle_pane_shutdown(token, &mut state, &mut clients, poll.registry());
                                     continue;
                                 }
                                 Err(e) => {
                                     error!("pane read error {:?}: {e:?}", token);
-                                    let mut source = SourceFd(&pane.fd);
-                                    if let Err(e2) = poll.registry().deregister(&mut source) {
-                                        error!("deregister pane {:?}: {e2:?}", token);
-                                    }
-                                    state.panes.remove(&token);
+                                    handle_pane_shutdown(token, &mut state, &mut clients, poll.registry());
                                     continue;
                                 }
                             }
@@ -321,6 +313,34 @@ fn prepare_socket_path(socket: &Path) -> io::Result<()> {
         fs::remove_file(socket)?;
     }
     Ok(())
+}
+
+/// Tear down a pane and drop any clients that were attached to it to ensure
+/// their read threads get EOF and the benchmark scripts don't hang.
+fn handle_pane_shutdown(
+    token: Token,
+    state: &mut State,
+    clients: &mut HashMap<Token, ClientConn>,
+    registry: &mio::Registry,
+) {
+    if let Some(pane) = state.panes.remove(&token) {
+        let mut source = SourceFd(&pane.fd);
+        if let Err(e) = registry.deregister(&mut source) {
+            error!("deregister pane {:?}: {e:?}", token);
+        }
+        // Drop any clients attached to this pane.
+        let attached: Vec<Token> = clients
+            .iter()
+            .filter_map(|(ctok, c)| (c.attached_pane == Some(token)).then_some(*ctok))
+            .collect();
+        for ctok in attached {
+            if let Some(mut c) = clients.remove(&ctok) {
+                let _ = registry.deregister(&mut c.stream);
+            }
+        }
+        // Remove reverse lookup.
+        state.pane_token_by_id.remove(&pane.id);
+    }
 }
 
 fn register_new_pane(state: &mut State, registry: &mio::Registry) -> io::Result<Token> {
