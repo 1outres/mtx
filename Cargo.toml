@@ -1,0 +1,13 @@
+[workspace]
+members = [
+  "crates/daemon",
+  "crates/client",
+  "crates/protocol",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+authors = ["mxr contributors"]
+

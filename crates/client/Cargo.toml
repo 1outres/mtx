@@ -1,0 +1,10 @@
+[package]
+name = "mxr"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+mxr-protocol = { path = "../protocol" }
+nix = { version = "0.28", default-features = false, features = ["term", "ioctl", "signal", "fs"] }
+signal-hook = "0.3"
